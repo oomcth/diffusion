@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.functional as F
 import torchvision
+import gc
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
@@ -50,14 +51,14 @@ else:
 T_max = 50
 lr = 1e-4
 weight_decay = 1e-4
-weight_dtype = torch.float32
+weight_dtype = torch.float16
 first_epoch = 0
 last_epoch = 100
 train_layers_ls = list(range(40))
 token_loss_scale = 1
 pixel_loss_scale = 1
 resolution = 512  # 768
-batch_size = 32
+batch_size = 2
 caption_column = 'text'
 image_column = 'image'
 json_path = 'train/data/metadata.jsonl'
@@ -240,7 +241,7 @@ attn_transforms = transforms.Compose(
 )
 
 tokenizer = CLIPTokenizer.from_pretrained(
-    "openai/clip-vit-base-patch32"
+    "CompVis/stable-diffusion-v1-4", subfolder='tokenizer'
 )
 
 dataset_preprocess = DatasetPreprocess(
@@ -286,28 +287,22 @@ dataset = create_enriched_dataset(
     base_path=data_dir,
     mask_base_path=mask_path
 )
-print(len(dataset))
 
 # initialize Modules and other training classes
 text_encoder: nn.Module = CLIPTextModel.from_pretrained(
-    "openai/clip-vit-base-patch32"
+    "CompVis/stable-diffusion-v1-4", subfolder='text_encoder'
 )
 
 vae: nn.Module = AutoencoderKL.from_pretrained(
-    "stabilityai/sd-vae-ft-mse"
+    "CompVis/stable-diffusion-v1-4", subfolder='vae'
 )
 
 noise_scheduler = DDPMScheduler()
 
-model: nn.Module = UNet2DConditionModel(
-   sample_size=64,
-   in_channels=4,
-   down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
-   up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-   block_out_channels=(320, 640),
-   layers_per_block=2,
-   cross_attention_dim=768,
+model: nn.Module = UNet2DConditionModel.from_pretrained(
+    "CompVis/stable-diffusion-v1-4", subfolder="unet"
 )
+
 
 optimizer = optim.AdamW(
     model.parameters(),
@@ -325,6 +320,7 @@ if args.checkpoint_name:
     )
 
 controller = AttentionStore()
+register_attention_control(model, controller)
 
 dataset = dataset_preprocess.preprocess(dataset)
 train_data_loader = torch.utils.data.DataLoader(
@@ -335,10 +331,11 @@ train_data_loader = torch.utils.data.DataLoader(
 
 # set pretrained model to device and set nograd = True
 text_encoder.requires_grad_(False)
-text_encoder.to(device, dtype=weight_dtype)
+text_encoder.to(device).to(weight_dtype)
 vae.requires_grad_(False)
-vae.to(device, dtype=weight_dtype)
-
+vae.to(device).to(weight_dtype)
+model.requires_grad_(True)
+model.to(device).to(weight_dtype)
 
 # train
 step_cnt = 0
@@ -347,11 +344,11 @@ for epoch in range(first_epoch, last_epoch):
     model.train()
     train_loss = 0.0
     for step, batch in enumerate(train_data_loader):
+        controller.reset()
+
         latents = vae.encode(
-            vae.encode(
-                batch["pixel_values"].to(weight_dtype)
+                batch["pixel_values"].to(weight_dtype).to(device)
             ).latent_dist.sample()
-        )
         latents = latents * vae.config.scaling_factor
 
         # noise our latents
@@ -362,13 +359,17 @@ for epoch in range(first_epoch, last_epoch):
         timesteps = timesteps.long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        input_ids = batch["input_ids"]
+        input_ids = batch["input_ids"].to(device)
         encoder_hidden_states = text_encoder(input_ids)[0]
         model_pred = model(
-            noisy_latents, timesteps, encoder_hidden_states
+            torch.rand_like(noisy_latents.to(weight_dtype)),
+            timesteps,
+            torch.rand_like(encoder_hidden_states.to(weight_dtype))
         ).sample
-
+        print(model_pred)
+        input()
         prompts = batch["text"]
+
         postprocess_seg_ls = batch["postprocess_seg_ls"]
 
         word_token_idx_ls = []
@@ -385,63 +386,65 @@ for epoch in range(first_epoch, last_epoch):
 
             seg_gt = item[1]
             gt_seg_ls.append(seg_gt)
-            attn_dict = get_cross_attn_map_from_unet(
-                attention_store=controller,
-                is_training_sd21=False
-            )
-            token_loss = 0.0
-            pixel_loss = 0.0
-
-            grounding_loss_dict = {}
-
-            # mid_8, up_16, up_32, up_64 for sd14
-            for layer_res in train_layers_ls:
-
-                attn_loss_dict = get_grounding_loss_by_layer(
-                    _gt_seg_list=gt_seg_ls,
-                    word_token_idx_ls=word_token_idx_ls,
-                    res=layer_res,
-                    input_attn_map_ls=attn_dict[layer_res],
-                    is_training_sd21=False,
-                )
-
-                layer_token_loss = attn_loss_dict["token_loss"]
-                layer_pixel_loss = attn_loss_dict["pixel_loss"]
-
-                grounding_loss_dict[f"token/{layer_res}"] = layer_token_loss
-                grounding_loss_dict[f"pixel/{layer_res}"] = layer_pixel_loss
-
-                token_loss += layer_token_loss
-                pixel_loss += layer_pixel_loss
-
-            grounding_loss = token_loss_scale * token_loss
-            grounding_loss += pixel_loss_scale * pixel_loss
-
-            denoise_loss = F.mse_loss(model_pred.float(),
-                                      noise.float(),
-                                      reduction="mean")
-
-            # get learing rate
-            lr = scheduler.get_last_lr()[0]
-
-            step_cnt += 1
-
-            loss = denoise_loss + grounding_loss
-
-            controller.reset()
-
-            train_loss += loss.item()
-
-            # Backpropagate
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-        global_step += 1
-        train_loss = 0.0
-        save(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            current_epoch=epoch
+        attn_dict = get_cross_attn_map_from_unet(
+            attention_store=controller,
+            is_training_sd21=False
         )
+        print(attn_dict["up_32"])
+        print(attn_dict.keys())
+        token_loss = 0.0
+        pixel_loss = 0.0
+
+        grounding_loss_dict = {}
+
+        # mid_8, up_16, up_32, up_64 for sd14
+        for layer_res in ['down_64', 'down_32', 'mid_32', 'up_64', 'up_32']:
+
+            attn_loss_dict = get_grounding_loss_by_layer(
+                _gt_seg_list=gt_seg_ls,
+                word_token_idx_ls=word_token_idx_ls,
+                res=layer_res,
+                input_attn_map_ls=attn_dict[layer_res],
+                is_training_sd21=False,
+            )
+
+            layer_token_loss = attn_loss_dict["token_loss"]
+            layer_pixel_loss = attn_loss_dict["pixel_loss"]
+
+            grounding_loss_dict[f"token/{layer_res}"] = layer_token_loss
+            grounding_loss_dict[f"pixel/{layer_res}"] = layer_pixel_loss
+
+            token_loss += layer_token_loss
+            pixel_loss += layer_pixel_loss
+
+        grounding_loss = token_loss_scale * token_loss
+        grounding_loss += pixel_loss_scale * pixel_loss
+
+        denoise_loss = F.mse_loss(model_pred.float(),
+                                  noise.float(),
+                                  reduction="mean")
+
+        # get learing rate
+        lr = scheduler.get_last_lr()[0]
+
+        step_cnt += 1
+
+        loss = denoise_loss + grounding_loss
+
+        controller.reset()
+
+        train_loss += loss.item()
+
+        # Backpropagate
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+    global_step += 1
+    train_loss = 0.0
+    save(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        current_epoch=epoch
+    )

@@ -128,8 +128,9 @@ def register_attention_control(unet_model, controller):
                 encoder_hidden_states = self.norm_encoder_hidden_states(
                     encoder_hidden_states
                 )
-
+            print(encoder_hidden_states.size())
             key = self.to_k(encoder_hidden_states)
+            print(key.size())
             value = self.to_v(encoder_hidden_states)
 
             query = self.head_to_batch_dim(query)
@@ -159,6 +160,9 @@ def register_attention_control(unet_model, controller):
                 hidden_states = hidden_states + residual
 
             hidden_states = hidden_states / self.rescale_output_factor
+            print(f"query: {query.shape}, key: {key.shape}, value: {value.shape}")
+            print(f"attention_probs: mean={attention_probs.mean()}, std={attention_probs.std()}")
+            assert torch.isfinite(attention_probs).all(), "attention_probs contains NaN or Inf!"
 
             return hidden_states
         return forward
@@ -199,10 +203,9 @@ def register_attention_control(unet_model, controller):
 
 
 def get_cross_attn_map_from_unet(attention_store: AttentionStore,
-                                 is_training_sd21, reses=[64, 32, 16, 8],
+                                 is_training_sd21, reses=[64, 32],
                                  poses=["down", "mid", "up"]):
     attention_maps = attention_store.get_average_attention()
-
     attn_dict = {}
 
     if is_training_sd21:
@@ -212,10 +215,12 @@ def get_cross_attn_map_from_unet(attention_store: AttentionStore,
         for res in reses:
             temp_list = []
             for item in attention_maps[f"{pos}_cross"]:
+                print(item)
                 if item.shape[1] == res ** 2:
                     cross_maps = item.reshape(-1, res, res, item.shape[-1])
                     temp_list.append(cross_maps)
             # if such resolution exists
             if len(temp_list) > 0:
+                print("1 modified")
                 attn_dict[f"{pos}_{res}"] = temp_list
     return attn_dict
