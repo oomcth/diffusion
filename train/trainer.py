@@ -215,9 +215,7 @@ def create_enriched_dataset(filtered_dataset,
             "valid": Value("bool")
         })
     )
-    final_dataset = dataset.filter(
-        lambda x: x["valid"]
-        ).remove_columns(["valid", "image_path"])
+    final_dataset = dataset.remove_columns(["valid", "image_path"])
     return final_dataset
 
 
