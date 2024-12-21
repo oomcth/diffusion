@@ -140,8 +140,8 @@ def create_enriched_dataset(filtered_dataset,
                     "image_path": path,
                     "text": metadata.get('text', ''),
                     "words": valid_words,
-                    "mask_paths": valid_masks,
-                    "label": label
+                    "attn_list": valid_masks,
+                    "label": label,
                 }
 
             except Exception as e:
@@ -155,7 +155,7 @@ def create_enriched_dataset(filtered_dataset,
             "image_path": Value("string"),
             "text": Value("string"),
             "words": Sequence(Value("string")),
-            "mask_paths": Sequence(Value("string")),
+            "attn_list": Sequence(Value("string")),
             "label": ClassLabel(num_classes=1, names=["default"])
         })
     )
@@ -179,12 +179,21 @@ def create_enriched_dataset(filtered_dataset,
     def load_images(example):
         try:
             if "image_path" not in example:
-                print(f"Error: 'image_path' not found in example: {example}")
-                return None
+                example["image_path"] = ""
+            if "attn_list" not in example:
+                example["attn_list"] = []
+            if "text" not in example:
+                example["text"] = ""
+            if "words" not in example:
+                example["words"] = []
+            if "label" not in example:
+                example["label"] = 0
+            if "valid" not in example:
+                example["valid"] = True
             example["image"] = Image().encode_example(example["image_path"])
             example["masks"] = [
                 Image().encode_example(mask_path)
-                for mask_path in example["mask_paths"]
+                for mask_path in example["attn_list"]
                 if os.path.exists(mask_path)
             ]
 
@@ -196,9 +205,11 @@ def create_enriched_dataset(filtered_dataset,
     dataset = dataset.map(
         load_images,
         features=Features({
+            "image_path": Value("string"),
             "image": Image(),
             "text": Value("string"),
             "words": Sequence(Value("string")),
+            "attn_list": Sequence(Value("string")),
             "masks": Sequence(Image()),
             "label": ClassLabel(num_classes=1, names=["default"]),
             "valid": Value("bool")
@@ -206,7 +217,7 @@ def create_enriched_dataset(filtered_dataset,
     )
     final_dataset = dataset.filter(
         lambda x: x["valid"]
-        ).remove_columns(["valid", "image_path", "mask_paths"])
+        ).remove_columns(["valid", "image_path"])
     return final_dataset
 
 
