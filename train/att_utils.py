@@ -7,6 +7,9 @@ https://github.com/google/prompt-to-prompt/blob/main/ptp_utils.py
 
 import abc
 import torch
+import torch
+from typing import Optional, List, Dict
+import numpy as np
 
 LOW_RESOURCE = False
 SD14_TO_SD21_RATIO = 1.5
@@ -125,23 +128,29 @@ def register_attention_control(unet_model, controller):
             if encoder_hidden_states is None:
                 encoder_hidden_states = hidden_states
             elif self.norm_cross:
+                print("cross_norm")
                 encoder_hidden_states = self.norm_encoder_hidden_states(
                     encoder_hidden_states
                 )
-            print(encoder_hidden_states.size())
             key = self.to_k(encoder_hidden_states)
-            print(key.size())
             value = self.to_v(encoder_hidden_states)
-
             query = self.head_to_batch_dim(query)
             key = self.head_to_batch_dim(key)
             value = self.head_to_batch_dim(value)
-
-            attention_probs = self.get_attention_scores(query, key,
-                                                        attention_mask)
-
+            print(key.size())
+            print(query.size())
+            print(value.size())
+            print(encoder_hidden_states.size())
+            assert torch.isfinite(query).all(), "query contains NaN or Inf!"
+            assert torch.isfinite(key).all(), "key contains NaN or Inf!"
+            assert torch.isfinite(value).all(), "value contains NaN or Inf!"
+            print(self.get_attention_scores)
+            attention_probs = self.get_attention_scores(
+                query, key, attention_mask)
+            assert torch.isfinite(attention_probs).all(), "attention_probs0 contains NaN or Inf!"
             attention_probs = controller(attention_probs, is_cross,
                                          place_in_unet)
+            assert torch.isfinite(attention_probs).all(), "attention_probs1 contains NaN or Inf!"
 
             hidden_states = torch.bmm(attention_probs, value)
             hidden_states = self.batch_to_head_dim(hidden_states)
@@ -224,3 +233,132 @@ def get_cross_attn_map_from_unet(attention_store: AttentionStore,
                 print("1 modified")
                 attn_dict[f"{pos}_{res}"] = temp_list
     return attn_dict
+
+
+class AttentionController:
+    def __init__(self, unet):
+        """
+        Initialize the attention controller for UNet2DConditionModel
+        
+        Args:
+            unet: The UNet2DConditionModel instance
+        """
+        self.unet = unet
+        self.attn_dict = {
+            'down_64': [],
+            'down_32': [],
+            'mid_32': [],
+            'up_32': [],
+            'up_64': []
+        }
+        self.attention_stores = {}
+        self._register_hooks()
+    
+    def _get_map_key(self, layer_name: str) -> Optional[str]:
+        """
+        Determine which attention dictionary key a layer belongs to
+        
+        Args:
+            layer_name: Name of the attention layer
+            
+        Returns:
+            Corresponding key in attn_dict or None if no match
+        """
+        if 'down_blocks' in layer_name:
+            block_idx = int(layer_name.split('.')[1])
+            return 'down_64' if block_idx < 2 else 'down_32'
+        elif 'mid_block' in layer_name:
+            return 'mid_32'
+        elif 'up_blocks' in layer_name:
+            block_idx = int(layer_name.split('.')[1])
+            return 'up_32' if block_idx < 2 else 'up_64'
+        return None
+        
+    def _register_hooks(self):
+        """Register forward hooks on attention modules"""
+        def hook_fn(module, input, output, layer_name):
+            # Get the appropriate key for this layer
+            map_key = self._get_map_key(layer_name)
+            if map_key is not None:
+                # Store attention maps in the appropriate list
+                self.attn_dict[map_key].append(output.detach())
+            
+            # Store attention statistics
+            with torch.no_grad():
+                stats = {
+                    'mean': output.mean().item(),
+                    'std': output.std().item(),
+                    'min': output.min().item(),
+                    'max': output.max().item()
+                }
+                self.attention_stores[layer_name] = stats
+            
+            return output
+            
+        # Register hooks for each attention block
+        for name, module in self.unet.named_modules():
+            if "attn" in name.lower():  # This catches different attention module names
+                module.register_forward_hook(
+                    lambda mod, inp, out, name=name: hook_fn(mod, inp, out, name)
+                )
+    
+    def reset_stores(self):
+        """Clear stored attention maps and statistics"""
+        for key in self.attn_dict:
+            self.attn_dict[key] = []
+        self.attention_stores.clear()
+    
+    def get_attention_maps(self, key: str) -> List[torch.Tensor]:
+        """
+        Get attention maps for a specific resolution level
+        
+        Args:
+            key: One of 'down_64', 'down_32', 'mid_32', 'up_32', 'up_64'
+            
+        Returns:
+            List of attention map tensors for that resolution
+        """
+        return self.attn_dict.get(key, [])
+    
+    def get_statistics(self, layer_name: Optional[str] = None) -> Dict:
+        """
+        Get attention statistics for all layers or a specific layer
+        
+        Args:
+            layer_name: Optional name of specific layer
+            
+        Returns:
+            Dictionary of attention statistics
+        """
+        if layer_name:
+            return self.attention_stores.get(layer_name, {})
+        return self.attention_stores
+    
+    def plot_attention_maps(self, key: str, max_maps: int = 4):
+        """
+        Plot attention maps for a specific resolution level
+        
+        Args:
+            key: One of 'down_64', 'down_32', 'mid_32', 'up_32', 'up_64'
+            max_maps: Maximum number of maps to plot
+        """
+        import matplotlib.pyplot as plt
+        
+        attention_maps = self.get_attention_maps(key)
+        if not attention_maps:
+            print(f"No attention maps found for {key}")
+            return
+            
+        num_maps = min(len(attention_maps), max_maps)
+        fig, axes = plt.subplots(1, num_maps, figsize=(5*num_maps, 5))
+        if num_maps == 1:
+            axes = [axes]
+            
+        for idx, (ax, attn_map) in enumerate(zip(axes, attention_maps[:num_maps])):
+            attn_map = attn_map.squeeze().cpu().numpy()
+            im = ax.imshow(attn_map, cmap='viridis')
+            ax.set_title(f"{key} - Map {idx+1}")
+            plt.colorbar(im, ax=ax)
+        
+        plt.tight_layout()
+        plt.show()

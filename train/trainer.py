@@ -1,7 +1,7 @@
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
+from att_utils import AttentionController
 from tqdm import tqdm
 import argparse
 from torchvision.io import read_image
@@ -319,8 +319,8 @@ if args.checkpoint_name:
         model, optimizer, scheduler, 'checkpoints/' + args.checkpoint_name
     )
 
-controller = AttentionStore()
-register_attention_control(model, controller)
+controller = AttentionController(model)
+
 
 dataset = dataset_preprocess.preprocess(dataset)
 train_data_loader = torch.utils.data.DataLoader(
@@ -344,7 +344,7 @@ for epoch in range(first_epoch, last_epoch):
     model.train()
     train_loss = 0.0
     for step, batch in enumerate(train_data_loader):
-        controller.reset()
+        controller.reset_stores()
 
         latents = vae.encode(
                 batch["pixel_values"].to(weight_dtype).to(device)
@@ -366,8 +366,7 @@ for epoch in range(first_epoch, last_epoch):
             timesteps,
             torch.rand_like(encoder_hidden_states.to(weight_dtype))
         ).sample
-        print(model_pred)
-        input()
+
         prompts = batch["text"]
 
         postprocess_seg_ls = batch["postprocess_seg_ls"]
@@ -386,10 +385,7 @@ for epoch in range(first_epoch, last_epoch):
 
             seg_gt = item[1]
             gt_seg_ls.append(seg_gt)
-        attn_dict = get_cross_attn_map_from_unet(
-            attention_store=controller,
-            is_training_sd21=False
-        )
+        attn_dict = controller.attn_dict
         print(attn_dict["up_32"])
         print(attn_dict.keys())
         token_loss = 0.0
@@ -431,7 +427,7 @@ for epoch in range(first_epoch, last_epoch):
 
         loss = denoise_loss + grounding_loss
 
-        controller.reset()
+        controller.reset_stores()
 
         train_loss += loss.item()
 
