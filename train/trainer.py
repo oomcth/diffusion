@@ -32,6 +32,7 @@ import json
 from datasets import Dataset, Features, Image, ClassLabel, Sequence, Value
 import os
 from typing import Dict, List, Any
+from torch.utils.data import Subset, DataLoader
 
 
 # parser
@@ -281,6 +282,7 @@ class FilteredDataset(torchvision.datasets.DatasetFolder):
 
 
 dataset = FilteredDataset(data_dir, valid_files)
+
 dataset = create_enriched_dataset(
     dataset,
     metadata_path=json_path,
@@ -319,8 +321,8 @@ if args.checkpoint_name:
         model, optimizer, scheduler, 'checkpoints/' + args.checkpoint_name
     )
 
-controller = AttentionController(model)
-
+controller = AttentionStore()
+register_attention_control(model, controller)
 
 dataset = dataset_preprocess.preprocess(dataset)
 train_data_loader = torch.utils.data.DataLoader(
@@ -344,13 +346,12 @@ for epoch in range(first_epoch, last_epoch):
     model.train()
     train_loss = 0.0
     for step, batch in enumerate(train_data_loader):
-        controller.reset_stores()
+        controller.reset()
 
         latents = vae.encode(
                 batch["pixel_values"].to(weight_dtype).to(device)
             ).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
-
         # noise our latents
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -362,9 +363,9 @@ for epoch in range(first_epoch, last_epoch):
         input_ids = batch["input_ids"].to(device)
         encoder_hidden_states = text_encoder(input_ids)[0]
         model_pred = model(
-            torch.rand_like(noisy_latents.to(weight_dtype)),
+            noisy_latents.to(weight_dtype),
             timesteps,
-            torch.rand_like(encoder_hidden_states.to(weight_dtype))
+            encoder_hidden_states.to(weight_dtype)
         ).sample
 
         prompts = batch["text"]
@@ -373,6 +374,7 @@ for epoch in range(first_epoch, last_epoch):
 
         word_token_idx_ls = []
         gt_seg_ls = []
+
         for item in postprocess_seg_ls:
             words_indices = []
 
@@ -385,16 +387,17 @@ for epoch in range(first_epoch, last_epoch):
 
             seg_gt = item[1]
             gt_seg_ls.append(seg_gt)
-        attn_dict = controller.attn_dict
-        print(attn_dict["up_32"])
-        print(attn_dict.keys())
+        attn_dict = get_cross_attn_map_from_unet(
+            attention_store=controller,
+            is_training_sd21=False
+        )
         token_loss = 0.0
         pixel_loss = 0.0
-
         grounding_loss_dict = {}
 
         # mid_8, up_16, up_32, up_64 for sd14
-        for layer_res in ['down_64', 'down_32', 'mid_32', 'up_64', 'up_32']:
+        # 'mid_32',
+        for layer_res in ['down_64', 'down_32',  'up_64', 'up_32']:
 
             attn_loss_dict = get_grounding_loss_by_layer(
                 _gt_seg_list=gt_seg_ls,
@@ -416,9 +419,9 @@ for epoch in range(first_epoch, last_epoch):
         grounding_loss = token_loss_scale * token_loss
         grounding_loss += pixel_loss_scale * pixel_loss
 
-        denoise_loss = F.mse_loss(model_pred.float(),
-                                  noise.float(),
-                                  reduction="mean")
+        denoise_loss = nn.functional.mse_loss(model_pred.float(),
+                                              noise.float(),
+                                              reduction="mean")
 
         # get learing rate
         lr = scheduler.get_last_lr()[0]
@@ -427,7 +430,7 @@ for epoch in range(first_epoch, last_epoch):
 
         loss = denoise_loss + grounding_loss
 
-        controller.reset_stores()
+        controller.reset()
 
         train_loss += loss.item()
 
@@ -435,6 +438,10 @@ for epoch in range(first_epoch, last_epoch):
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+
+        print("coucou")
+        torch.mps.empty_cache()
+        gc.collect()
 
     global_step += 1
     train_loss = 0.0
