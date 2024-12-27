@@ -10,9 +10,21 @@ import torch
 import torch
 from typing import Optional, List, Dict
 import numpy as np
+import gc
+from torch.utils.checkpoint import checkpoint
+import sys
+import torch.nn.functional as F
+
 
 LOW_RESOURCE = False
 SD14_TO_SD21_RATIO = 1.5
+
+
+def get_size_in_gigabytes(obj):
+    size_in_bytes = sys.getsizeof(obj)
+    # Convertir en gigaoctets
+    size_in_gigabytes = size_in_bytes / (1024 ** 3)
+    return size_in_gigabytes
 
 
 class AttentionControl(abc.ABC):
@@ -28,7 +40,7 @@ class AttentionControl(abc.ABC):
         return self.num_att_layers if LOW_RESOURCE else 0
 
     @abc.abstractmethod
-    def forward (self, attn, is_cross: bool, place_in_unet: str):
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
         raise NotImplementedError
 
     def __call__(self, attn, is_cross: bool, place_in_unet: str):
@@ -72,7 +84,13 @@ class AttentionStore(AttentionControl):
         self.step_store = self.get_empty_store()
 
     def get_average_attention(self):
-        average_attention = {key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store}
+        # print("len", len(self.attention_store))
+        average_attention = {}
+
+        for key, values in self.attention_store.items():
+            values = [tensor.cpu() for tensor in values]
+            average_attention[key] = [value / self.cur_step for value in values]
+            gc.collect()
         return average_attention
 
     def reset(self):
@@ -94,7 +112,8 @@ def register_attention_control(unet_model, controller):
         else:
             to_out = self.to_out
 
-        def forward(hidden_states, encoder_hidden_states=None, attention_mask=None,temb=None,):
+        def forward(hidden_states, encoder_hidden_states=None,
+                    attention_mask=None, temb=None,):
             is_cross = encoder_hidden_states is not None
 
             residual = hidden_states
@@ -106,60 +125,118 @@ def register_attention_control(unet_model, controller):
 
             if input_ndim == 4:
                 batch_size, channel, height, width = hidden_states.shape
-                hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+                hidden_states = hidden_states.view(
+                    batch_size, channel, height * width
+                    ).transpose(1, 2)
 
             batch_size, sequence_length, _ = (
                 hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
             )
-            attention_mask = self.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = self.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size
+            )
 
             if self.group_norm is not None:
-                hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+                hidden_states = self.group_norm(
+                    hidden_states.transpose(1, 2)
+                ).transpose(1, 2)
+            # print(torch.isnan(hidden_states).any())
 
             query = self.to_q(hidden_states)
-
+            # print(torch.isnan(query).any())
             if encoder_hidden_states is None:
                 encoder_hidden_states = hidden_states
             elif self.norm_cross:
-                encoder_hidden_states = self.norm_encoder_hidden_states(encoder_hidden_states)
+                encoder_hidden_states = self.norm_encoder_hidden_states(
+                    encoder_hidden_states
+                )
+            # print(torch.isnan(encoder_hidden_states).any())
 
             key = self.to_k(encoder_hidden_states)
+            # print(torch.isnan(key).any())
             value = self.to_v(encoder_hidden_states)
-
+            # print(torch.isnan(value).any())
             query = self.head_to_batch_dim(query)
+            # print(torch.isnan(query).any())
             key = self.head_to_batch_dim(key)
+            # print(torch.isnan(key).any())
             value = self.head_to_batch_dim(value)
+            # print(torch.isnan(value).any())
 
-            attention_probs = self.get_attention_scores(query, key, attention_mask)
+            # attention_probs = self.get_attention_scores(
+            #     query, key, attention_mask
+            # )
+            scores = torch.matmul(query, key.transpose(-2, -1))
+            head_dim = query.size(-1)
+            scores = scores / torch.sqrt(torch.tensor(head_dim,
+                                                      dtype=torch.float16,
+                                                      device=query.device))
 
-            attention_probs = controller(attention_probs, is_cross, place_in_unet)
+            # Apply the attention mask if provided
+            if attention_mask is not None:
+                scores = scores + attention_mask
+
+            # Convert scores to probabilities using softmax
+            attention_probs = F.softmax(scores, dim=-1)
+            # print('prob', torch.isnan(attention_probs).any())
+
+            attention_probs = controller(
+                attention_probs, is_cross, place_in_unet
+            )
+            # print('prob2', torch.isnan(attention_probs).any())
 
             hidden_states = torch.bmm(attention_probs, value)
+            # print(torch.isnan(hidden_states).any())
+
             hidden_states = self.batch_to_head_dim(hidden_states)
+            # print(torch.isnan(hidden_states).any())
 
             # linear proj
             hidden_states = to_out(hidden_states)
+            # print(torch.isnan(hidden_states).any())
             # all drop out in diffusers are 0.0
             # so we here ignore dropout
 
             if input_ndim == 4:
-                hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+                hidden_states = hidden_states.transpose(-1, -2).reshape(
+                    batch_size, channel, height, width
+                )
+            # print(torch.isnan(hidden_states).any())
 
             if self.residual_connection:
                 hidden_states = hidden_states + residual
+            # print(torch.isnan(hidden_states).any())
 
             hidden_states = hidden_states / self.rescale_output_factor
+            # print(torch.isnan(hidden_states).any())
+            # if torch.isnan(hidden_states).any():
+            #     print("Le tenseur contient des NaN.")
+            # else:
+            #     print("Le tenseur est ok")
 
             return hidden_states
         return forward
 
     assert controller is not None, "controller must be specified"
 
+    # def register_recr(net_, count, place_in_unet):
+    #     Vérifie si le nom de la classe du module est 'Attention'
+    #     if hasattr(net_, 'children'):
+    #         for child in net_.children():
+    #             register_recr(child, count, place_in_unet)
+    #     elif net_.__class__.__name__ == 'Attention':
+    #         net_.forward = ca_forward(net_, place_in_unet)
+    #         return count + 1
+    #     return count
+
     def register_recr(net_, count, place_in_unet):
         if net_.__class__.__name__ == 'Attention':
+            # print("+1")
+            # print(type(net_))
             net_.forward = ca_forward(net_, place_in_unet)
             return count + 1
         elif hasattr(net_, 'children'):
+            # print("found")
             for net__ in net_.children():
                 count = register_recr(net__, count, place_in_unet)
         return count
@@ -188,15 +265,17 @@ def register_attention_control(unet_model, controller):
     controller.num_att_layers = cross_att_count
 
 
-def get_cross_attn_map_from_unet(attention_store: AttentionStore, is_training_sd21, 
-                                 reses=[64, 32, 16, 8], poses=["down", "mid", "up"]):
+def get_cross_attn_map_from_unet(attention_store: AttentionStore,
+                                 is_training_sd21,
+                                 reses=[64, 32, 16, 8],
+                                 poses=["down", "mid", "up"]):
     attention_maps = attention_store.get_average_attention()
 
     attn_dict = {}
 
     if is_training_sd21:
         reses = [int(SD14_TO_SD21_RATIO * item) for item in reses]
-    
+
     for pos in poses:
         for res in reses:
             temp_list = []
@@ -242,7 +321,8 @@ class AttentionController:
         Reshape attention scores to spatial dimensions
 
         Args:
-            attn_probs: Attention probabilities [batch, heads, sequence_length, sequence_length]
+            attn_probs: Attention probabilities [batch, heads,
+            sequence_length, sequence_length]
         """
         batch_size, height_width, n_tokens = attn_probs.shape
         height = width = int(np.sqrt(height_width))
@@ -268,7 +348,9 @@ class AttentionController:
             query = module.head_to_batch_dim(query)
             key = module.head_to_batch_dim(key)
 
-            attention_scores = torch.matmul(query, key.transpose(-1, -2)) * module.scale
+            attention_scores = torch.matmul(
+                query, key.transpose(-1, -2)
+            ) * module.scale
 
             # Apply softmax
             attention_probs = attention_scores.softmax(dim=-1)
@@ -279,7 +361,9 @@ class AttentionController:
                     map_key = self._get_map_key(name)
                     if map_key is not None:
                         # Reshape and store attention
-                        reshaped_attn = self._reshape_attention_scores(attention_probs)
+                        reshaped_attn = self._reshape_attention_scores(
+                            attention_probs
+                        )
                         self.attn_dict[map_key].append(reshaped_attn.detach())
                     break
 
@@ -288,7 +372,8 @@ class AttentionController:
         # Register hooks for CrossAttention modules
         for name, module in self.unet.named_modules():
             if "attn" in name.lower():
-                if hasattr(module, 'to_q'):  # Verify it's a CrossAttention module
+                if hasattr(module, 'to_q'):
+                    # Verify it's a CrossAttention module
                     module.register_forward_hook(attention_forward_hook)
 
     def reset_stores(self):
@@ -305,7 +390,8 @@ class AttentionController:
         """
         return self.attn_dict.get(key, [])
 
-    def visualize_attention(self, key: str, token_idx: int = 0, batch_idx: int = 0):
+    def visualize_attention(self, key: str, token_idx: int = 0,
+                            batch_idx: int = 0):
         """
         Visualize attention maps for a specific token
 

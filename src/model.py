@@ -15,7 +15,10 @@ parser.add_argument("--img_per_prompt", type=int, default=10)
 args = parser.parse_args()
 
 model_name = args.model_name
-pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.float32)
+pipe = StableDiffusionPipeline.from_pretrained(
+    model_name,
+    torch_dtype=torch.float32
+)
 
 distributed_state = PartialState()
 pipe.to(distributed_state.device)

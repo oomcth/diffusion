@@ -9,6 +9,7 @@ import torch
 from typing import Dict, Any
 import torch.nn as nn
 import torch.optim as optim
+from typing import Union
 import torch.functional as F
 import torchvision
 import gc
@@ -48,6 +49,7 @@ elif torch.backends.mps.is_available():
 else:
     device = 'cpu'
 
+
 # set parameter TODO use parser instead
 T_max = 50
 lr = 1e-4
@@ -65,6 +67,51 @@ image_column = 'image'
 json_path = 'train/data/metadata.jsonl'
 data_dir = 'train/data/img/'  # 'train/data/train2017/'
 mask_path = 'train/data/'
+
+
+def get_model_size_gb(model: Union[torch.nn.Module, torch.Tensor]) -> float:
+    """Calculate model size in gigabytes."""
+    if isinstance(model, torch.nn.Module):
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        size_bytes = param_size + buffer_size
+    else:
+        size_bytes = model.nelement() * model.element_size()
+
+    return size_bytes / (1024 ** 3)  # Convert to GB
+
+
+def print_models_size(*models, names=None):
+    """Print size of multiple models."""
+    if names is None:
+        names = [f"Model {i+1}" for i in range(len(models))]
+
+    for name, model in zip(names, models):
+        size_gb = get_model_size_gb(model)
+        print(f"{name}: {size_gb:.2f} GB")
+
+
+def print_components_size(text_encoder, tokenizer):
+    """Print memory size of text encoder and tokenizer in GB"""
+    import sys
+    import torch
+
+    def get_size_gb(obj):
+        if isinstance(obj, torch.nn.Module):
+            return sum(
+                p.nelement() * p.element_size() for p in obj.parameters()
+            ) / (1024**3)
+        return sys.getsizeof(obj) / (1024**3)
+
+    encoder_size = get_size_gb(text_encoder)
+    tokenizer_size = get_size_gb(tokenizer)
+
+    print(f"Text Encoder: {encoder_size:.2f} GB")
+    print(f"Tokenizer: {tokenizer_size:.2f} GB")
 
 
 def load_metadata(jsonl_path: str) -> Dict[str, Dict]:
@@ -244,6 +291,9 @@ attn_transforms = transforms.Compose(
 tokenizer = CLIPTokenizer.from_pretrained(
     "CompVis/stable-diffusion-v1-4", subfolder='tokenizer'
 )
+text_encoder: nn.Module = CLIPTextModel.from_pretrained(
+    "CompVis/stable-diffusion-v1-4", subfolder='text_encoder'
+)
 
 dataset_preprocess = DatasetPreprocess(
     caption_column=caption_column,
@@ -255,10 +305,13 @@ dataset_preprocess = DatasetPreprocess(
 )
 
 valid_files = set()
+count = 0
 with open(data_dir + "/metadata.jsonl", 'r') as f:
     for line in f:
-        metadata = json.loads(line.strip())
-        valid_files.add(metadata["file_name"])
+        count += 1
+        if count < 100:
+            metadata = json.loads(line.strip())
+            valid_files.add(metadata["file_name"])
 
 
 class FilteredDataset(torchvision.datasets.DatasetFolder):
@@ -291,10 +344,6 @@ dataset = create_enriched_dataset(
 )
 
 # initialize Modules and other training classes
-text_encoder: nn.Module = CLIPTextModel.from_pretrained(
-    "CompVis/stable-diffusion-v1-4", subfolder='text_encoder'
-)
-
 vae: nn.Module = AutoencoderKL.from_pretrained(
     "CompVis/stable-diffusion-v1-4", subfolder='vae'
 )
@@ -305,12 +354,13 @@ model: nn.Module = UNet2DConditionModel.from_pretrained(
     "CompVis/stable-diffusion-v1-4", subfolder="unet"
 )
 
+# optimizer = optim.AdamW(
+#     model.parameters(),
+#     lr=lr,
+#     weight_decay=weight_decay
+# )
+optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
-optimizer = optim.AdamW(
-    model.parameters(),
-    lr=lr,
-    weight_decay=weight_decay
-)
 
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
     optimizer=optimizer,
@@ -335,9 +385,15 @@ train_data_loader = torch.utils.data.DataLoader(
 text_encoder.requires_grad_(False)
 text_encoder.to(device).to(weight_dtype)
 vae.requires_grad_(False)
-vae.to(device).to(weight_dtype)
+vae.to(weight_dtype)
 model.requires_grad_(True)
-model.to(device).to(weight_dtype)
+model.to(weight_dtype)
+
+
+os.system('cls' if os.name == 'nt' else 'clear')
+# print_components_size(text_encoder, tokenizer)
+# print_models_size(model)
+# print_models_size(vae)
 
 # train
 step_cnt = 0
@@ -345,11 +401,12 @@ global_step = 0
 for epoch in range(first_epoch, last_epoch):
     model.train()
     train_loss = 0.0
-    for step, batch in enumerate(train_data_loader):
+    for step, batch in tqdm(enumerate(train_data_loader)):
         controller.reset()
-
+        batch["pixel_values"] = batch["pixel_values"].to(weight_dtype).to(device)
+        vae = vae.to(device)
         latents = vae.encode(
-                batch["pixel_values"].to(weight_dtype).to(device)
+                batch["pixel_values"]
             ).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
         # noise our latents
@@ -359,7 +416,8 @@ for epoch in range(first_epoch, last_epoch):
         timesteps = torch.randint(0, max_timestep, (bsz,), device=device)
         timesteps = timesteps.long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
+        vae = vae.to('cpu')
+        model = model.to(device)
         input_ids = batch["input_ids"].to(device)
         encoder_hidden_states = text_encoder(input_ids)[0]
         model_pred = model(
@@ -422,7 +480,6 @@ for epoch in range(first_epoch, last_epoch):
         denoise_loss = nn.functional.mse_loss(model_pred.float(),
                                               noise.float(),
                                               reduction="mean")
-
         # get learing rate
         lr = scheduler.get_last_lr()[0]
 
@@ -433,13 +490,14 @@ for epoch in range(first_epoch, last_epoch):
         controller.reset()
 
         train_loss += loss.item()
-
+        model = model.to('cpu')
         # Backpropagate
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
 
-        print("coucou")
+        batch["pixel_values"] = batch["pixel_values"].to(weight_dtype).to('cpu')
+        print('cumulative', train_loss, "local", loss.item())
         torch.mps.empty_cache()
         gc.collect()
 

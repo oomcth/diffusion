@@ -87,15 +87,14 @@ def get_grounding_loss_by_layer(_gt_seg_list, word_token_idx_ls, res,
         # add binary
         gt_seg_list[i] = (gt_seg_list[i] > 0.0).float()
 
-
-    ################### token loss start ###################
+    # token loss start
     # Following code is adapted from
     # https://github.com/silent-chen/layout-guidance/blob/08b687470f911c7f57937012bdf55194836d693e/utils.py#L27
     token_loss = 0.0
     count = 0
     for attn_map in input_attn_map_ls:
         b, H, W, j = attn_map.shape
-        
+
         for i in range(len(word_token_idx_ls)):  # [[word1 token_idx1, word1 token_idx2, ...], [word2 token_idx1, word2 token_idx2, ...]]
             obj_loss = 0.0
             single_word_idx_ls = word_token_idx_ls[i]  # [token_idx1, token_idx2, ...]
@@ -110,12 +109,14 @@ def get_grounding_loss_by_layer(_gt_seg_list, word_token_idx_ls, res,
                     obj_loss += (1.0 - torch.mean(activation_value)) ** 2
 
                 token_loss += (obj_loss/len(single_word_idx_ls))
+                del mask, activation_value
+            del single_word_idx_ls
 
     # normalize with len words
     token_loss = token_loss / count
-    ################## token loss end ##########################
-    
-    ################## pixel loss start ######################
+    # token loss end
+
+    # pixel loss start
     # average cross attention map on different layers
     avg_attn_map_ls = []
     for i in range(len(input_attn_map_ls)):
@@ -126,7 +127,6 @@ def get_grounding_loss_by_layer(_gt_seg_list, word_token_idx_ls, res,
     avg_attn_map = avg_attn_map.sum(0) / avg_attn_map.shape[0]
     avg_attn_map = avg_attn_map.unsqueeze(0)
 
-    bce_loss_func = nn.BCELoss()
     pixel_loss = 0.0
     count = 0
     for i in range(len(word_token_idx_ls)):
