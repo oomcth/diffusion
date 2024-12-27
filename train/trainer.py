@@ -498,7 +498,8 @@ for epoch in range(first_epoch, last_epoch):
 
         batch["pixel_values"] = batch["pixel_values"].to(weight_dtype).to('cpu')
         print('cumulative', train_loss, "local", loss.item())
-        torch.mps.empty_cache()
+        if device == 'cpu':
+            torch.mps.empty_cache()
         gc.collect()
 
     global_step += 1
