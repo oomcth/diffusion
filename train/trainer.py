@@ -54,9 +54,9 @@ clip_model_name = "openai/clip-vit-large-patch14"
 
 
 # train Param
-clip = False
-supervision = False
-poor = True
+clip = True
+supervision = True
+poor = False
 
 
 # data preprocess
@@ -290,8 +290,14 @@ for epoch in range(first_epoch, last_epoch):
 
         step_cnt += 1
         print('denoise', denoise_loss)
-        print('grounding', grounding_loss)
-        print('clip', clip_loss)
+        if supervision:
+            print('grounding', grounding_loss)
+        else:
+            grounding_loss = 0
+        if clip:
+            print('clip', clip_loss)
+        else:
+            clip_loss = 0
 
         loss = denoise_loss + grounding_loss + clip_loss
 
