@@ -3,10 +3,10 @@ Following Code is adapted from
 https://github.com/microsoft/VISOR/blob/main/visor.py
 '''
 
-import json 
+import json
 import argparse
 from tabulate import tabulate
-import numpy as np 
+import numpy as np
 from glob import glob
 
 NUM_TO_PERCENT = 100

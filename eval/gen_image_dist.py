@@ -1,21 +1,46 @@
-import torch
+"""
+code adapted from
+"""
+
+
 import json
 import argparse
 from tqdm import tqdm
 from diffusers import StableDiffusionPipeline
 from accelerate import PartialState
+from transformers import CLIPTextModel, CLIPTokenizer
+from diffusers import AutoencoderKL, UNet2DConditionModel
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--text_file_path", type=str, required=True)
 parser.add_argument("--output_dir", type=str, required=True)
-parser.add_argument("--model_name", type=str, default="CompVis/stable-diffusion-v1-4")
+parser.add_argument("--model_name", type=str,
+                    default="CompVis/stable-diffusion-v1-4")
 parser.add_argument("--img_per_prompt", type=int, default=10)
 
 args = parser.parse_args()
 
 model_name = args.model_name
-pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.float32)
+clip_model_name = "openai/clip-vit-large-patch14"
+vae_model_path = "CompVis/stable-diffusion-v1-4"
+unet_model_path = ""
+
+tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+text_encoder = CLIPTextModel.from_pretrained(clip_model_name)
+
+vae = AutoencoderKL.from_pretrained(vae_model_path, subfolder="vae")
+
+unet = UNet2DConditionModel.from_pretrained(unet_model_path)
+
+
+pipe = StableDiffusionPipeline(
+    text_encoder=text_encoder,
+    tokenizer=tokenizer,
+    vae=vae,
+    unet=unet,
+    scheduler=None
+)
 
 distributed_state = PartialState()
 pipe.to(distributed_state.device)
