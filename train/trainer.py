@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from typing import Union
 import torch.functional as F
+from transformers import CLIPTokenizer, CLIPModel
 import torchvision
 import gc
 from torchvision import transforms
@@ -23,7 +24,8 @@ from att_utils import register_attention_control, get_cross_attn_map_from_unet
 from utils import save, load
 import numpy as np
 from data_utils.data_utils import DatasetPreprocess
-from data_utils.data_utils import get_grounding_loss_by_layer, get_word_idx
+from data_utils.data_utils import get_word_idx
+from loss import get_grounding_loss_by_layer
 from torchvision.transforms import ToTensor
 from torch.utils.data import DataLoader
 import json
@@ -32,6 +34,7 @@ import os
 import json
 from datasets import Dataset, Features, Image, ClassLabel, Sequence, Value
 import os
+from torchvision.ops import roi_pool
 from typing import Dict, List, Any
 from torch.utils.data import Subset, DataLoader
 
@@ -61,12 +64,19 @@ train_layers_ls = list(range(40))
 token_loss_scale = 1
 pixel_loss_scale = 1
 resolution = 512  # 768
-batch_size = 2
+batch_size = 1
 caption_column = 'text'
 image_column = 'image'
 json_path = 'train/data/metadata.jsonl'
 data_dir = 'train/data/img/'  # 'train/data/train2017/'
 mask_path = 'train/data/'
+clip_model_name = "openai/clip-vit-base-patch16"
+clip_model_name = "openai/clip-vit-large-patch14"
+
+
+# train Param
+clip = False
+supervision = False
 
 
 def get_model_size_gb(model: Union[torch.nn.Module, torch.Tensor]) -> float:
@@ -95,7 +105,7 @@ def print_models_size(*models, names=None):
         print(f"{name}: {size_gb:.2f} GB")
 
 
-def print_components_size(text_encoder, tokenizer):
+def print_components_size(clip_encoder, tokenizer):
     """Print memory size of text encoder and tokenizer in GB"""
     import sys
     import torch
@@ -107,7 +117,7 @@ def print_components_size(text_encoder, tokenizer):
             ) / (1024**3)
         return sys.getsizeof(obj) / (1024**3)
 
-    encoder_size = get_size_gb(text_encoder)
+    encoder_size = get_size_gb(clip_encoder)
     tokenizer_size = get_size_gb(tokenizer)
 
     print(f"Text Encoder: {encoder_size:.2f} GB")
@@ -288,12 +298,15 @@ attn_transforms = transforms.Compose(
     ]
 )
 
-tokenizer = CLIPTokenizer.from_pretrained(
-    "CompVis/stable-diffusion-v1-4", subfolder='tokenizer'
-)
-text_encoder: nn.Module = CLIPTextModel.from_pretrained(
-    "CompVis/stable-diffusion-v1-4", subfolder='text_encoder'
-)
+# tokenizer = CLIPTokenizer.from_pretrained(
+#     "CompVis/stable-diffusion-v1-4", subfolder='tokenizer'
+# )
+# clip_encoder: nn.Module = CLIPTextModel.from_pretrained(
+#     "CompVis/stable-diffusion-v1-4", subfolder='clip_encoder'
+# )
+
+tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
+clip_encoder = CLIPModel.from_pretrained(clip_model_name)
 
 dataset_preprocess = DatasetPreprocess(
     caption_column=caption_column,
@@ -382,8 +395,8 @@ train_data_loader = torch.utils.data.DataLoader(
 )
 
 # set pretrained model to device and set nograd = True
-text_encoder.requires_grad_(False)
-text_encoder.to(device).to(weight_dtype)
+clip_encoder.requires_grad_(False)
+clip_encoder.to(device).to(weight_dtype)
 vae.requires_grad_(False)
 vae.to(weight_dtype)
 model.requires_grad_(True)
@@ -391,7 +404,7 @@ model.to(weight_dtype)
 
 
 os.system('cls' if os.name == 'nt' else 'clear')
-# print_components_size(text_encoder, tokenizer)
+# print_components_size(clip_encoder, tokenizer)
 # print_models_size(model)
 # print_models_size(vae)
 
@@ -404,11 +417,14 @@ for epoch in range(first_epoch, last_epoch):
     for step, batch in tqdm(enumerate(train_data_loader)):
         controller.reset()
         batch["pixel_values"] = batch["pixel_values"].to(weight_dtype).to(device)
+        # print(batch["pixel_values"].size())
         vae = vae.to(device)
         latents = vae.encode(
                 batch["pixel_values"]
             ).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
+        # print(latents.size())
+        # input()
         # noise our latents
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -419,86 +435,143 @@ for epoch in range(first_epoch, last_epoch):
         vae = vae.to('cpu')
         model = model.to(device)
         input_ids = batch["input_ids"].to(device)
-        encoder_hidden_states = text_encoder(input_ids)[0]
+        encoder_hidden_states = clip_encoder.text_model(input_ids)[0]
         model_pred = model(
             noisy_latents.to(weight_dtype),
             timesteps,
             encoder_hidden_states.to(weight_dtype)
         ).sample
+        if supervision:
+            prompts = batch["text"]
 
-        prompts = batch["text"]
+            postprocess_seg_ls = batch["postprocess_seg_ls"]
 
-        postprocess_seg_ls = batch["postprocess_seg_ls"]
+            word_token_idx_ls = []
+            gt_seg_ls = []
 
-        word_token_idx_ls = []
-        gt_seg_ls = []
+            for item in postprocess_seg_ls:
+                words_indices = []
 
-        for item in postprocess_seg_ls:
-            words_indices = []
+                words = item[0][0]
+                words = words.lower()
 
-            words = item[0][0]
-            words = words.lower()
+                words_indices = get_word_idx(prompts[0], words, tokenizer)
 
-            words_indices = get_word_idx(prompts[0], words, tokenizer)
+                word_token_idx_ls.append(words_indices)
 
-            word_token_idx_ls.append(words_indices)
-
-            seg_gt = item[1]
-            gt_seg_ls.append(seg_gt)
-        attn_dict = get_cross_attn_map_from_unet(
-            attention_store=controller,
-            is_training_sd21=False
-        )
-        token_loss = 0.0
-        pixel_loss = 0.0
-        grounding_loss_dict = {}
-
-        # mid_8, up_16, up_32, up_64 for sd14
-        # 'mid_32',
-        for layer_res in ['down_64', 'down_32',  'up_64', 'up_32']:
-
-            attn_loss_dict = get_grounding_loss_by_layer(
-                _gt_seg_list=gt_seg_ls,
-                word_token_idx_ls=word_token_idx_ls,
-                res=layer_res,
-                input_attn_map_ls=attn_dict[layer_res],
-                is_training_sd21=False,
+                seg_gt = item[1]
+                # print(seg_gt.size())
+                gt_seg_ls.append(seg_gt)
+            attn_dict = get_cross_attn_map_from_unet(
+                attention_store=controller,
+                is_training_sd21=False
             )
+            token_loss = 0.0
+            pixel_loss = 0.0
+            grounding_loss_dict = {}
 
-            layer_token_loss = attn_loss_dict["token_loss"]
-            layer_pixel_loss = attn_loss_dict["pixel_loss"]
+            # mid_8, up_16, up_32, up_64 for sd14
+            # 'mid_32',
+            for layer_res in ['down_64', 'down_32', 'up_64', 'up_32']:
 
-            grounding_loss_dict[f"token/{layer_res}"] = layer_token_loss
-            grounding_loss_dict[f"pixel/{layer_res}"] = layer_pixel_loss
+                attn_loss_dict = get_grounding_loss_by_layer(
+                    _gt_seg_list=gt_seg_ls,
+                    word_token_idx_ls=word_token_idx_ls,
+                    res=layer_res,
+                    input_attn_map_ls=attn_dict[layer_res],
+                    is_training_sd21=False,
+                )
 
-            token_loss += layer_token_loss
-            pixel_loss += layer_pixel_loss
+                layer_token_loss = attn_loss_dict["token_loss"]
+                layer_pixel_loss = attn_loss_dict["pixel_loss"]
 
-        grounding_loss = token_loss_scale * token_loss
-        grounding_loss += pixel_loss_scale * pixel_loss
+                grounding_loss_dict[f"token/{layer_res}"] = layer_token_loss
+                grounding_loss_dict[f"pixel/{layer_res}"] = layer_pixel_loss
+
+                token_loss += layer_token_loss
+                pixel_loss += layer_pixel_loss
+
+            grounding_loss = token_loss_scale * token_loss
+            grounding_loss += pixel_loss_scale * pixel_loss
 
         denoise_loss = nn.functional.mse_loss(model_pred.float(),
                                               noise.float(),
                                               reduction="mean")
-        # get learing rate
+
+        # print(prompts)
+        # print(word_token_idx_ls)
+        # input()
+        # print(gt_seg_ls)
+        # input()
+        # input_ids
+
+        # clip loss
+        if clip:
+            text_embeddings = clip_encoder.text_model(input_ids=input_ids)[0]
+            temperature = 0.1
+
+            # text emb
+            word_embeddings = []
+            for token_indices_list in word_token_idx_ls:
+                token_embeds = text_embeddings[0, token_indices_list, :]
+                word_embedding = token_embeds.mean(dim=0)
+                word_embeddings.append(word_embedding)
+            word_embeddings = torch.stack(word_embeddings)
+
+            # img emb
+            boxes = []
+            for gt_mask in gt_seg_ls:
+                indices = torch.nonzero(gt_mask.squeeze(0, 1) == 1)
+                min_x, min_y = indices.min(dim=0).values
+                max_x, max_y = indices.max(dim=0).values
+                boxes.append(torch.tensor([1, min_x.item(), min_y.item(),
+                                          max_x.item(), max_y.item()]))
+            boxes = torch.stack(boxes).squeeze(1).to(device,
+                                                     dtype=weight_dtype)
+            image_embeddings = roi_pool(input=latents-model_pred,
+                                        boxes=boxes,
+                                        output_size=(28, 28))
+            image_embeddings = image_embeddings.mean(dim=1)
+            image_embeddings = image_embeddings.view(
+                image_embeddings.size(0), 784
+            )
+            image_embeddings = image_embeddings[:, :768]
+
+            norms = image_embeddings.norm(p=2, dim=1, keepdim=True)
+            norms = torch.where(norms == 0, torch.ones_like(norms), norms)
+            image_embeddings_normalized = image_embeddings / norms
+            word_embeddings = torch.nn.functional.normalize(word_embeddings,
+                                                            dim=1)
+
+            logits = torch.matmul(
+                image_embeddings, word_embeddings.T
+            ) / temperature
+            labels = torch.arange(logits.size(0), device=logits.device)
+            loss_t2r = torch.nn.functional.cross_entropy(logits, labels)
+            loss_r2t = torch.nn.functional.cross_entropy(logits.T, labels)
+            clip_loss = (loss_t2r + loss_r2t) / 2.0
+
         lr = scheduler.get_last_lr()[0]
 
         step_cnt += 1
+        print('denoise', denoise_loss)
+        print('grounding', grounding_loss)
+        print('clip', clip_loss)
 
-        loss = denoise_loss + grounding_loss
+        loss = denoise_loss + grounding_loss + clip_loss
 
         controller.reset()
 
-        train_loss += loss.item()
+        train_loss += loss
         model = model.to('cpu')
         # Backpropagate
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
 
-        batch["pixel_values"] = batch["pixel_values"].to(weight_dtype).to('cpu')
+        batch["pixel_values"] = batch["pixel_values"].to('cpu')
         print('cumulative', train_loss, "local", loss.item())
-        if device == 'cpu':
+        if device == 'mps':
             torch.mps.empty_cache()
         gc.collect()
 
@@ -508,5 +581,6 @@ for epoch in range(first_epoch, last_epoch):
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        current_epoch=epoch
+        current_epoch=epoch,
+        filepath="checkpoint" + str(epoch)
     )
