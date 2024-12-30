@@ -158,7 +158,10 @@ class DatasetPreprocess:
                     attn_gt
                 ])
             examples["postprocess_seg_ls"].append(postprocess_attn_list)
-
+        del examples["image"]
+        del examples["attn_list"]
+        del examples["masks"]
+        del examples["label"]
         return examples
 
     def preprocess(self, input_dataset):

@@ -162,8 +162,10 @@ clip_encoder.requires_grad_(False)
 clip_encoder.to(device).to(weight_dtype)
 vae.requires_grad_(False)
 vae.to(weight_dtype)
+vae.to(device)
 model.requires_grad_(True)
 model.to(weight_dtype)
+model.to(device)
 
 
 os.system('cls' if os.name == 'nt' else 'clear')
@@ -177,10 +179,8 @@ for epoch in range(first_epoch, last_epoch):
 
         # forward pass
         controller.reset()
-        batch["pixel_values"] = batch["pixel_values"].to(weight_dtype)
-        batch["pixel_values"] = batch["pixel_values"].to(device)
         latents = vae.encode(  # encode image into latent representation
-                batch["pixel_values"]
+                batch["pixel_values"].to(device).to(weight_dtype)
             ).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
 
