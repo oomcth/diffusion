@@ -1,16 +1,22 @@
-from PIL import Image
+"""
+
+Overall the way I load my data is suboptimal, I missunderstood some
+hugging face documentation. I could have do what this file does in
+a way more effiscient way.
+
+Still my methods gives descent performances and is acceptable for the project.
+
+"""
+
+
 import os
 import numpy as np
-import torch
 from typing import Dict
 import json
 from datasets import Dataset, Features, ClassLabel, Sequence, Value
 import datasets
 import torchvision
 from torchvision.io import read_image
-
-
-SD14_TO_SD21_RATIO = 1.5
 
 
 def get_word_idx(text: str, tgt_word, tokenizer):
@@ -36,9 +42,12 @@ def get_word_idx(text: str, tgt_word, tokenizer):
             break
 
     if first_token_idx == -1:
+        # would be usefull if we try to have
+        # greater than one batch size
         return -1
 
-    tgt_word_tokens_idx_ls = [i + 1 + first_token_idx for i in range(len(encoded_tgt_word))]
+    tgt_word_tokens_idx_ls = [i + 1 + first_token_idx
+                              for i in range(len(encoded_tgt_word))]
 
     encoded_text = tokenizer.encode(text)
 
@@ -53,7 +62,7 @@ def get_word_idx(text: str, tgt_word, tokenizer):
     tgt_word_ls = tgt_word.split(" ")
     striped_tgt_word = "".join(tgt_word_ls).strip("#")
 
-    assert decoded_tgt_word == striped_tgt_word, "decode_text != striped_tar_wd"
+    assert decoded_tgt_word == striped_tgt_word
 
     return tgt_word_tokens_idx_ls
 
@@ -83,7 +92,8 @@ class DatasetPreprocess:
                 captions.append(caption)
             else:
                 raise ValueError(
-                    f"Caption column `{self.caption_column}` must contain strings or lists of strings."
+                    f"Caption column `{self.caption_column}` must"
+                    f"contain strings or lists of strings."
                 )
 
         inputs = self.tokenizer(
@@ -94,30 +104,35 @@ class DatasetPreprocess:
 
     def data_preprocess_train(self, examples):
 
-        images = [image.convert("RGB") for image in examples[self.image_column]]
+        images = [image.convert("RGB")
+                  for image in examples[self.image_column]]
 
-        examples["pixel_values"] = np.array([self.train_transforms(image) for image in images])
+        examples["pixel_values"] = np.array(
+            [self.train_transforms(image) for image in images]
+        )
 
         examples["input_ids"] = self.tokenize_captions(examples)
 
         examples["postprocess_seg_ls"] = []
         maxi = 0
 
-        def pad_words(words, max_words=4, padding_word="rien"):
-            num_words = len(words)
-            for _ in range(max_words-num_words):
-                words.append(padding_word)
-            words = words[:max_words]
-            return words
+        # Would be usefull if we do batch_size > 1
+        # for now its completely useless
+        # def pad_words(words, max_words=4, padding_word="rien"):
+        #     num_words = len(words)
+        #     for _ in range(max_words-num_words):
+        #         words.append(padding_word)
+        #     words = words[:max_words]
+        #     return words
 
-        def pad_masks(masks,
-                      max_masks=4,
-                      mask_shape=(1, 512, 512)):
-            num_masks = len(masks)
-            for _ in range(max_masks-num_masks):
-                masks.append(torch.zeros(mask_shape))
-            masks = masks[:max_masks]
-            return masks
+        # def pad_masks(masks,
+        #               max_masks=4,
+        #               mask_shape=(1, 512, 512)):
+        #     num_masks = len(masks)
+        #     for _ in range(max_masks-num_masks):
+        #         masks.append(torch.zeros(mask_shape))
+        #     masks = masks[:max_masks]
+        #     return masks
 
         for i in range(len(examples["attn_list"])):
             maxi = max(maxi, len(examples["attn_list"][i]))
@@ -143,11 +158,6 @@ class DatasetPreprocess:
                     attn_gt
                 ])
             examples["postprocess_seg_ls"].append(postprocess_attn_list)
-        del examples["image"]
-        del examples["attn_list"]
-        del examples["label"]
-        del examples["masks"]
-        del examples["words"]
 
         return examples
 
@@ -155,6 +165,7 @@ class DatasetPreprocess:
         return input_dataset.with_transform(self.data_preprocess_train)
 
 
+# load json
 def load_metadata(jsonl_path: str) -> Dict[str, Dict]:
     metadata_dict = {}
     with open(jsonl_path, 'r') as f:
@@ -165,6 +176,7 @@ def load_metadata(jsonl_path: str) -> Dict[str, Dict]:
     return metadata_dict
 
 
+# get mask files loc
 def get_mask_path(mask_base_path: str,
                   image_filename: str,
                   mask_filename: str) -> str:
@@ -176,13 +188,14 @@ def get_mask_path(mask_base_path: str,
     return full_path
 
 
+# add metadata to dataset
 def create_enriched_dataset(filtered_dataset,
                             base_path: str,
                             metadata_path: str,
                             mask_base_path: str):
     metadata_dict = load_metadata(metadata_path)
 
-    def generator():
+    def generator():  # I debugged on my PC that has low RAM so I use generator
         for path, label in filtered_dataset.samples:
             try:
                 file_name = os.path.basename(path)
@@ -256,7 +269,8 @@ def create_enriched_dataset(filtered_dataset,
                 example["label"] = 0
             if "valid" not in example:
                 example["valid"] = True
-            example["image"] = datasets.Image().encode_example(example["image_path"])
+            example["image"] = datasets.Image(
+                ).encode_example(example["image_path"])
             example["masks"] = [
                 datasets.Image().encode_example(mask_path)
                 for mask_path in example["attn_list"]

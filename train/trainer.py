@@ -43,6 +43,8 @@ train_layers_ls = list(range(40))
 token_loss_scale = 1
 pixel_loss_scale = 1
 resolution = 512
+# Batch size must be 1 (I try to implement batch_size > 1 but too much
+# python loop led to poor performances.
 batch_size = 1
 caption_column = 'text'
 image_column = 'image'
@@ -82,13 +84,15 @@ attn_transforms = transforms.Compose(
 tokenizer = CLIPTokenizer.from_pretrained(clip_model_name)
 clip_encoder = CLIPModel.from_pretrained(clip_model_name)
 
-
+# I have to go thought the whole coco dataset and take
+#  the correctly anotated files.
+# Most of the data code is in data_utils
 valid_files = set()
 count = 0
 with open(data_dir + "/metadata.jsonl", 'r') as f:
     for line in f:
         count += 1
-        if count < 100 or not poor:
+        if count < 100 or not poor:  # if poor just use 100 images
             metadata = json.loads(line.strip())
             valid_files.add(metadata["file_name"])
 
@@ -101,6 +105,7 @@ dataset = create_enriched_dataset(
     mask_base_path=mask_path
 )
 
+# other main models of the project
 vae: nn.Module = AutoencoderKL.from_pretrained(
     "CompVis/stable-diffusion-v1-4", subfolder='vae'
 )
@@ -111,25 +116,32 @@ model: nn.Module = UNet2DConditionModel.from_pretrained(
     "CompVis/stable-diffusion-v1-4", subfolder="unet"
 )
 
+# Use AdamW as optimizer
 optimizer = optim.AdamW(
     model.parameters(),
     lr=lr,
     weight_decay=weight_decay
 )
 
+# Cosine scheduler  TODO warmup with fixed or decreassing lr
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
     optimizer=optimizer,
     T_max=T_max,
 )
 
+# We can resume training from a checkpoint
+# TODO in the case where we load a checkpoint we did a useless
+# init of model
 if args.checkpoint_name:
     first_epoch = load(
         model, optimizer, scheduler, 'checkpoints/' + args.checkpoint_name
     )
 
+# Class that get attention from different layer of the Unet
 controller = AttentionStore()
 register_attention_control(model, controller)
 
+# Main data code
 dataset_preprocess = DatasetPreprocess(
     caption_column=caption_column,
     image_column=image_column,
@@ -145,6 +157,7 @@ train_data_loader = torch.utils.data.DataLoader(
     batch_size=batch_size,
 )
 
+# Only unet is to train. Also, set device and dtype
 clip_encoder.requires_grad_(False)
 clip_encoder.to(device).to(weight_dtype)
 vae.requires_grad_(False)
@@ -157,28 +170,31 @@ os.system('cls' if os.name == 'nt' else 'clear')
 
 
 # train
-step_cnt = 0
-global_step = 0
 for epoch in range(first_epoch, last_epoch):
     model.train()
-    train_loss = 0.0
+    train_loss = 0.0  # get average loss over epoch
     for step, batch in tqdm(enumerate(train_data_loader)):
+
+        # forward pass
         controller.reset()
         batch["pixel_values"] = batch["pixel_values"].to(weight_dtype)
         batch["pixel_values"] = batch["pixel_values"].to(device)
-        vae = vae.to(device)
-        latents = vae.encode(
+        latents = vae.encode(  # encode image into latent representation
                 batch["pixel_values"]
             ).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
+
+        # generate noise
         noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
         max_timestep = noise_scheduler.config.num_train_timesteps
-        timesteps = torch.randint(0, max_timestep, (bsz,), device=device)
+        timesteps = torch.randint(
+            0, max_timestep, (batch_size,),
+            device=device
+        )
         timesteps = timesteps.long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        vae = vae.to('cpu')
-        model = model.to(device)
+
+        # main model forward pass
         input_ids = batch["input_ids"].to(device)
         encoder_hidden_states = clip_encoder.text_model(input_ids)[0]
         model_pred = model(
@@ -186,15 +202,16 @@ for epoch in range(first_epoch, last_epoch):
             timesteps,
             encoder_hidden_states.to(weight_dtype)
         ).sample
+
+        # token level supervision losses
         if supervision:
             prompts = batch["text"]
-
             postprocess_seg_ls = batch["postprocess_seg_ls"]
 
-            word_token_idx_ls = []
-            gt_seg_ls = []
-
+            word_token_idx_ls = []  # token positions
+            gt_seg_ls = []  # masks
             for item in postprocess_seg_ls:
+                # extract ground truth mask and token position
                 words_indices = []
 
                 words = item[0][0]
@@ -208,12 +225,11 @@ for epoch in range(first_epoch, last_epoch):
                 gt_seg_ls.append(seg_gt)
             attn_dict = get_cross_attn_map_from_unet(
                 attention_store=controller,
-                is_training_sd21=False
             )
             token_loss = 0.0
             pixel_loss = 0.0
-            grounding_loss_dict = {}
 
+            # get losses for each pertinent layers
             for layer_res in ['down_64', 'down_32', 'up_64', 'up_32']:
 
                 attn_loss_dict = get_grounding_loss_by_layer(
@@ -221,24 +237,20 @@ for epoch in range(first_epoch, last_epoch):
                     word_token_idx_ls=word_token_idx_ls,
                     res=layer_res,
                     input_attn_map_ls=attn_dict[layer_res],
-                    is_training_sd21=False,
                 )
 
-                layer_token_loss = attn_loss_dict["token_loss"]
-                layer_pixel_loss = attn_loss_dict["pixel_loss"]
-
-                grounding_loss_dict[f"token/{layer_res}"] = layer_token_loss
-                grounding_loss_dict[f"pixel/{layer_res}"] = layer_pixel_loss
-
-                token_loss += layer_token_loss
-                pixel_loss += layer_pixel_loss
+                token_loss += attn_loss_dict[0]
+                pixel_loss += attn_loss_dict[1]
 
             grounding_loss = token_loss_scale * token_loss
             grounding_loss += pixel_loss_scale * pixel_loss
 
-        denoise_loss = nn.functional.mse_loss(model_pred.float(),
-                                              noise.float(),
-                                              reduction="mean")
+        # denoise loss
+        denoise_loss = nn.functional.mse_loss(
+            model_pred.float(),
+            noise.float(),
+            reduction="mean"
+        )
 
         # clip loss
         if clip:
@@ -286,9 +298,6 @@ for epoch in range(first_epoch, last_epoch):
             loss_r2t = torch.nn.functional.cross_entropy(logits.T, labels)
             clip_loss = (loss_t2r + loss_r2t) / 2.0
 
-        lr = scheduler.get_last_lr()[0]
-
-        step_cnt += 1
         print('denoise', denoise_loss)
         if supervision:
             print('grounding', grounding_loss)
@@ -303,21 +312,16 @@ for epoch in range(first_epoch, last_epoch):
 
         controller.reset()
 
-        train_loss += loss
-        model = model.to('cpu')
+        train_loss += loss / len(train_data_loader)
 
         # Backpropagate
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
 
-        batch["pixel_values"] = batch["pixel_values"].to('cpu')
         print('cumulative', train_loss, "local", loss.item())
-        if device == 'mps':
-            torch.mps.empty_cache()
         gc.collect()
 
-    global_step += 1
     train_loss = 0.0
     save(
         model=model,
