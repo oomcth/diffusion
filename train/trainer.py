@@ -321,7 +321,7 @@ for epoch in range(first_epoch, last_epoch):
 
         print('cumulative', train_loss, "local", loss.item())
         gc.collect()
-
+    print("epochloss: ", train_loss)
     train_loss = 0.0
     save(
         model=model,
