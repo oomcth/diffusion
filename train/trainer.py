@@ -132,9 +132,9 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(
 # We can resume training from a checkpoint
 # TODO in the case where we load a checkpoint we did a useless
 # init of model
-if args.checkpoint_name:
-    first_epoch = load(
-        model, optimizer, scheduler, 'checkpoints/' + args.checkpoint_name
+if True:
+    model, optimizer, scheduler, first_epoch = load(
+        model, optimizer, scheduler, 'train/checkpoint3.pth'
     )
 
 # Class that get attention from different layer of the Unet
@@ -309,7 +309,7 @@ for epoch in range(first_epoch, last_epoch):
             clip_loss = 0
 
         loss = denoise_loss + grounding_loss + clip_loss
-
+        loss.backward()
         controller.reset()
 
         train_loss += loss / len(train_data_loader)
@@ -328,5 +328,5 @@ for epoch in range(first_epoch, last_epoch):
         optimizer=optimizer,
         scheduler=scheduler,
         current_epoch=epoch,
-        filepath="checkpoint" + str(epoch)
+        filepath="checkpoint" + str(epoch) + ".pth"
     )

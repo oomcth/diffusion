@@ -106,10 +106,13 @@ class DatasetPreprocess:
 
         images = [image.convert("RGB")
                   for image in examples[self.image_column]]
-
+        print(images)
+        print(len(images))
+        print(self.train_transforms)
         examples["pixel_values"] = np.array(
             [self.train_transforms(image) for image in images]
         )
+        input()
 
         examples["input_ids"] = self.tokenize_captions(examples)
 
@@ -162,6 +165,9 @@ class DatasetPreprocess:
         del examples["attn_list"]
         del examples["masks"]
         del examples["label"]
+        del examples["words"]
+        print(examples.keys())
+        input()
         return examples
 
     def preprocess(self, input_dataset):
